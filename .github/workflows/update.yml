@@ -141,7 +141,6 @@ jobs:
 
           if [ "$NEW_COUNT" -lt 10000 ]; then
             echo "ERROR: suspiciously small RuleSet"
-            echo "Expected at least 10000 rules."
             exit 1
           fi
 
@@ -151,61 +150,60 @@ jobs:
           fi
 
           # ------------------------------------------------
-          # 3. Проверяем структуру каждой строки
+          # 3. Проверка формата строк
           #
           # Разрешаем:
           #   ||example.com
           #   ||foo.xn--p1ai
           #   ||144.31.236.132
           #
-          # Не разрешаем:
-          #   пустые строки
-          #   пробелы
-          #   строки без ||
-          #   управляющие символы
+          # Требуем только:
+          #   - строка начинается с ||
+          #   - после || есть хотя бы один символ
+          #   - нет пробелов
+          #   - нет управляющих символов
           # ------------------------------------------------
 
-          INVALID_COUNT="$(
-            awk '
-              NR == 1 {
-                if ($0 != "[AutoProxy]")
-                  print NR ": " $0
-                next
+          INVALID_FILE="$(mktemp)"
+
+          awk '
+            NR == 1 {
+              if ($0 != "[AutoProxy]") {
+                print NR ": " $0
+              }
+              next
+            }
+
+            {
+              invalid = 0
+
+              if ($0 !~ /^\|\|[^[:space:]]+$/) {
+                invalid = 1
               }
 
-              {
-                if (
-                  $0 !~ /^\|\|[^[:space:]]+$/ ||
-                  $0 ~ /[[:cntrl:]]/
-                )
-                  print NR ": " $0
+              if ($0 ~ /[[:cntrl:]]/) {
+                invalid = 1
               }
-            ' "$FILE" | wc -l
-          )"
+
+              if (invalid) {
+                print NR ": " $0
+              }
+            }
+          ' "$FILE" > "$INVALID_FILE"
+
+          INVALID_COUNT="$(wc -l < "$INVALID_FILE")"
+          INVALID_COUNT="${INVALID_COUNT//[[:space:]]/}"
 
           echo "Invalid lines: $INVALID_COUNT"
 
           if [ "$INVALID_COUNT" -ne 0 ]; then
             echo "ERROR: invalid lines detected:"
-            
-            awk '
-              NR == 1 {
-                if ($0 != "[AutoProxy]")
-                  print NR ": " $0
-                next
-              }
-
-              {
-                if (
-                  $0 !~ /^\|\|[^[:space:]]+$/ ||
-                  $0 ~ /[[:cntrl:]]/
-                )
-                  print NR ": " $0
-              }
-            ' "$FILE" | awk 'NR <= 20'
-
+            head -n 20 "$INVALID_FILE"
+            rm -f "$INVALID_FILE"
             exit 1
           fi
+
+          rm -f "$INVALID_FILE"
 
           # ------------------------------------------------
           # 4. Сравниваем размер с предыдущей версией
@@ -247,15 +245,17 @@ jobs:
           # ------------------------------------------------
           DUPLICATES="$(
             grep '^||' "$FILE" \
-              | sort \
-              | uniq -d \
+              | sort -u \
               | wc -l
           )"
 
-          echo "Duplicate rules: $DUPLICATES"
+          DUPLICATES="${DUPLICATES//[[:space:]]/}"
 
-          if [ "$DUPLICATES" -gt 0 ]; then
-            echo "WARNING: duplicate rules detected"
+          if [ "$DUPLICATES" -ne "$NEW_COUNT" ]; then
+            DUPLICATE_COUNT=$((NEW_COUNT - DUPLICATES))
+            echo "Duplicate rules: $DUPLICATE_COUNT"
+          else
+            echo "Duplicate rules: 0"
           fi
 
           # ------------------------------------------------
@@ -267,7 +267,6 @@ jobs:
           echo
           echo "First rules:"
           head -n 10 "$FILE"
-
       # --------------------------------------------------
       # Только теперь заменяем рабочий файл
       # --------------------------------------------------

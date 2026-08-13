@@ -1,0 +1,283 @@
+name: Update Oasis RuleSet
+
+on:
+  schedule:
+    # Проверять RunetFreedom каждые 6 часов.
+    - cron: "17 */6 * * *"
+
+  # Позволяет запустить workflow вручную.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      # --------------------------------------------------
+      # Получаем текущее содержимое репозитория
+      # --------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # Находим последний release RunetFreedom
+      # --------------------------------------------------
+      - name: Find latest RunetFreedom release
+        id: release
+        run: |
+          set -euo pipefail
+
+          API="https://api.github.com/repos/runetfreedom/russia-blocked-geosite/releases/latest"
+
+          RELEASE_JSON="$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "$API")"
+
+          TAG="$(jq -r '.tag_name // empty' <<< "$RELEASE_JSON")"
+
+          ASSET_URL="$(
+            jq -r '
+              .assets[]
+              | select(.name == "refilter.txt")
+              | .browser_download_url
+            ' <<< "$RELEASE_JSON" \
+            | head -n 1
+          )"
+
+          if [ -z "$TAG" ]; then
+            echo "ERROR: cannot determine latest release"
+            exit 1
+          fi
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "ERROR: refilter.txt not found in latest release: $TAG"
+            exit 1
+          fi
+
+          echo "Latest release: $TAG"
+          echo "Asset: $ASSET_URL"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset_url=$ASSET_URL" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------
+      # Скачиваем refilter.txt
+      # --------------------------------------------------
+      - name: Download RunetFreedom list
+        env:
+          ASSET_URL: ${{ steps.release.outputs.asset_url }}
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 5 \
+            "$ASSET_URL" \
+            -o refilter.txt
+
+          if [ ! -s refilter.txt ]; then
+            echo "ERROR: downloaded refilter.txt is empty"
+            exit 1
+          fi
+
+          echo "Downloaded refilter.txt:"
+          wc -l refilter.txt
+
+      # --------------------------------------------------
+      # Преобразуем RunetFreedom → Oasis AutoProxy
+      #
+      # example.com
+      #
+      # превращается в:
+      #
+      # ||example.com
+      # --------------------------------------------------
+      - name: Convert to Oasis AutoProxy
+        run: |
+          set -euo pipefail
+
+          {
+            echo "[AutoProxy]"
+
+            sed \
+              -e 's/\r$//' \
+              -e '/^[[:space:]]*$/d' \
+              -e '/^[[:space:]]*[#!;]/d' \
+              -e 's/^[[:space:]]*//' \
+              -e 's/[[:space:]]*$//' \
+              -e '/^[*|]/d' \
+              -e 's/^/||/' \
+              refilter.txt
+
+          } > oasis.new.txt
+
+      # --------------------------------------------------
+      # Проверяем новый RuleSet ДО замены старого
+      # --------------------------------------------------
+      - name: Validate new RuleSet
+        run: |
+          set -euo pipefail
+
+          FILE="oasis.new.txt"
+
+          # ------------------------------------------------
+          # Проверка заголовка
+          # ------------------------------------------------
+          if [ "$(head -n 1 "$FILE")" != "[AutoProxy]" ]; then
+            echo "ERROR: missing [AutoProxy] header"
+            exit 1
+          fi
+
+          # ------------------------------------------------
+          # Количество правил
+          # ------------------------------------------------
+          NEW_COUNT="$(grep -c '^||' "$FILE" || true)"
+
+          echo "New rule count: $NEW_COUNT"
+
+          # Защита от пустого/сильно обрезанного списка.
+          if [ "$NEW_COUNT" -lt 10000 ]; then
+            echo "ERROR: suspiciously small RuleSet"
+            echo "Expected at least 10000 rules."
+            exit 1
+          fi
+
+          # Защита от очевидного мусора.
+          if [ "$NEW_COUNT" -gt 2000000 ]; then
+            echo "ERROR: suspiciously large RuleSet"
+            exit 1
+          fi
+
+          # ------------------------------------------------
+          # Проверяем формат строк
+          # ------------------------------------------------
+          INVALID_COUNT="$(
+            grep -Ev \
+              '^(\[AutoProxy\]|^\|\|[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z]{2,})$' \
+              "$FILE" \
+              | wc -l
+          )"
+
+          if [ "$INVALID_COUNT" -ne 0 ]; then
+            echo "ERROR: invalid lines detected: $INVALID_COUNT"
+            echo
+            echo "First invalid lines:"
+
+            grep -En \
+              '^(\[AutoProxy\]|^\|\|[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z]{2,})$' \
+              "$FILE" \
+              >/dev/null || true
+
+            grep -Env \
+              '^(\[AutoProxy\]|^\|\|[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z]{2,})$' \
+              "$FILE" \
+              | head -n 20
+
+            exit 1
+          fi
+
+          # ------------------------------------------------
+          # Сравниваем размер с предыдущей версией
+          # ------------------------------------------------
+          if [ -f oasis.txt ]; then
+
+            OLD_COUNT="$(grep -c '^||' oasis.txt || true)"
+
+            echo "Previous rule count: $OLD_COUNT"
+
+            if [ "$OLD_COUNT" -gt 0 ]; then
+
+              LOWER=$((OLD_COUNT / 2))
+              UPPER=$((OLD_COUNT + OLD_COUNT / 2))
+
+              if [ "$NEW_COUNT" -lt "$LOWER" ]; then
+                echo "ERROR: RuleSet shrank by more than 50%"
+                echo "Old: $OLD_COUNT"
+                echo "New: $NEW_COUNT"
+                exit 1
+              fi
+
+              if [ "$NEW_COUNT" -gt "$UPPER" ]; then
+                echo "ERROR: RuleSet grew by more than 50%"
+                echo "Old: $OLD_COUNT"
+                echo "New: $NEW_COUNT"
+                exit 1
+              fi
+
+            fi
+
+          else
+            echo "No previous RuleSet found."
+            echo "Skipping size comparison."
+          fi
+
+          # ------------------------------------------------
+          # Проверяем дубликаты
+          # ------------------------------------------------
+          DUPLICATES="$(
+            grep '^||' "$FILE" \
+              | sort \
+              | uniq -d \
+              | wc -l
+          )"
+
+          echo "Duplicate rules: $DUPLICATES"
+
+          if [ "$DUPLICATES" -gt 0 ]; then
+            echo "WARNING: duplicate rules detected"
+          fi
+
+          # ------------------------------------------------
+          # Итог
+          # ------------------------------------------------
+          echo
+          echo "Validation successful."
+          echo "Rules: $NEW_COUNT"
+          echo
+          echo "First rules:"
+          head -n 10 "$FILE"
+
+      # --------------------------------------------------
+      # Только теперь заменяем рабочий файл
+      # --------------------------------------------------
+      - name: Install validated RuleSet
+        run: |
+          set -euo pipefail
+
+          mv oasis.new.txt oasis.txt
+
+          echo "New RuleSet installed."
+
+      # --------------------------------------------------
+      # Записываем версию RunetFreedom
+      # --------------------------------------------------
+      - name: Save release information
+        run: |
+          echo "${{ steps.release.outputs.tag }}" > VERSION
+
+      # --------------------------------------------------
+      # Сохраняем изменения в Git
+      # --------------------------------------------------
+      - name: Commit changes
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add oasis.txt VERSION
+
+          if git diff --cached --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+
+          git commit \
+            -m "Update RunetFreedom rules to ${{ steps.release.outputs.tag }}"
+
+          git push

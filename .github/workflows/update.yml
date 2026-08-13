@@ -125,7 +125,7 @@ jobs:
           FILE="oasis.new.txt"
 
           # ------------------------------------------------
-          # Проверка заголовка
+          # 1. Проверка заголовка
           # ------------------------------------------------
           if [ "$(head -n 1 "$FILE")" != "[AutoProxy]" ]; then
             echo "ERROR: missing [AutoProxy] header"
@@ -133,55 +133,82 @@ jobs:
           fi
 
           # ------------------------------------------------
-          # Количество правил
+          # 2. Количество правил
           # ------------------------------------------------
           NEW_COUNT="$(grep -c '^||' "$FILE" || true)"
 
           echo "New rule count: $NEW_COUNT"
 
-          # Защита от пустого/сильно обрезанного списка.
           if [ "$NEW_COUNT" -lt 10000 ]; then
             echo "ERROR: suspiciously small RuleSet"
             echo "Expected at least 10000 rules."
             exit 1
           fi
 
-          # Защита от очевидного мусора.
           if [ "$NEW_COUNT" -gt 2000000 ]; then
             echo "ERROR: suspiciously large RuleSet"
             exit 1
           fi
 
           # ------------------------------------------------
-          # Проверяем формат строк
+          # 3. Проверяем структуру каждой строки
+          #
+          # Разрешаем:
+          #   ||example.com
+          #   ||foo.xn--p1ai
+          #   ||144.31.236.132
+          #
+          # Не разрешаем:
+          #   пустые строки
+          #   пробелы
+          #   строки без ||
+          #   управляющие символы
           # ------------------------------------------------
+
           INVALID_COUNT="$(
-            grep -Ev \
-              '^(\[AutoProxy\]|^\|\|[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z]{2,})$' \
-              "$FILE" \
-              | wc -l
+            awk '
+              NR == 1 {
+                if ($0 != "[AutoProxy]")
+                  print NR ": " $0
+                next
+              }
+
+              {
+                if (
+                  $0 !~ /^\|\|[^[:space:]]+$/ ||
+                  $0 ~ /[[:cntrl:]]/
+                )
+                  print NR ": " $0
+              }
+            ' "$FILE" | wc -l
           )"
 
+          echo "Invalid lines: $INVALID_COUNT"
+
           if [ "$INVALID_COUNT" -ne 0 ]; then
-            echo "ERROR: invalid lines detected: $INVALID_COUNT"
-            echo
-            echo "First invalid lines:"
+            echo "ERROR: invalid lines detected:"
+            
+            awk '
+              NR == 1 {
+                if ($0 != "[AutoProxy]")
+                  print NR ": " $0
+                next
+              }
 
-            grep -En \
-              '^(\[AutoProxy\]|^\|\|[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z]{2,})$' \
-              "$FILE" \
-              >/dev/null || true
-
-            grep -Env \
-              '^(\[AutoProxy\]|^\|\|[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z]{2,})$' \
-              "$FILE" \
-              | head -n 20
+              {
+                if (
+                  $0 !~ /^\|\|[^[:space:]]+$/ ||
+                  $0 ~ /[[:cntrl:]]/
+                )
+                  print NR ": " $0
+              }
+            ' "$FILE" | awk 'NR <= 20'
 
             exit 1
           fi
 
           # ------------------------------------------------
-          # Сравниваем размер с предыдущей версией
+          # 4. Сравниваем размер с предыдущей версией
           # ------------------------------------------------
           if [ -f oasis.txt ]; then
 
@@ -216,7 +243,7 @@ jobs:
           fi
 
           # ------------------------------------------------
-          # Проверяем дубликаты
+          # 5. Дубликаты
           # ------------------------------------------------
           DUPLICATES="$(
             grep '^||' "$FILE" \
@@ -232,7 +259,7 @@ jobs:
           fi
 
           # ------------------------------------------------
-          # Итог
+          # 6. Итог
           # ------------------------------------------------
           echo
           echo "Validation successful."
